@@ -126,4 +126,4 @@ See [references/config-schema.md](references/config-schema.md) for the full conf
 
 ## License
 
-MIT
+[MIT](LICENSE)

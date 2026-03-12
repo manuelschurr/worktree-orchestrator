@@ -21,18 +21,25 @@ Supports multi-server setups where servers need to know each other's ports (e.g.
 
 ## Installation
 
-Clone this repo into your Claude Code skills directory:
+**Per-project** — available only in one project:
 
 ```bash
 cd your-project/.claude/skills
 git clone https://github.com/manuelschurr/worktree-orchestrator.git
 ```
 
-Or add as a git submodule:
+Or as a git submodule (so collaborators get it too):
 
 ```bash
 cd your-project
 git submodule add https://github.com/manuelschurr/worktree-orchestrator.git .claude/skills/worktree-orchestrator
+```
+
+**Global** — available in all your projects:
+
+```bash
+cd ~/.claude/skills
+git clone https://github.com/manuelschurr/worktree-orchestrator.git
 ```
 
 ## Quick Start

@@ -6,11 +6,12 @@ Supports multi-server setups where servers need to know each other's ports (e.g.
 
 ## Features
 
+- **Auto-launch Claude Code** — `spawn` opens a new terminal with Claude running in the worktree directory
 - **Auto-assigned ports** — no port ranges, no manual allocation, no collisions
 - **Cross-server port references** — use `{backend.port}` in frontend config and vice versa
 - **Secrets management** — `.orchestrator/.secrets` (gitignored) loaded into every server's environment
 - **Session lifecycle** — spawn, status, logs, kill, restart, cleanup
-- **Cross-platform** — Windows, macOS, Linux
+- **Cross-platform** — Windows Terminal, macOS Terminal.app, Linux terminal emulators
 - **Zero dependencies** — Python 3.9+ stdlib only
 
 ## Prerequisites
@@ -54,7 +55,7 @@ git clone https://github.com/manuelschurr/worktree-orchestrator.git
 | Command | What it does |
 |---------|-------------|
 | `init` | Creates `.orchestrator.toml`, `.orchestrator/.secrets`, updates `.gitignore` |
-| `spawn <n>` | Creates worktree + branch, starts all servers, registers session |
+| `spawn <n>` | Creates worktree + branch, starts all servers, opens Claude in a new terminal |
 | `status` | Shows all sessions with per-server health (UP/DOWN) |
 | `logs <session> [server]` | Shows server logs. Omit server name to see all. |
 | `kill <session> [--remove]` | Stops all servers. `--remove` also deletes the worktree. |
@@ -107,7 +108,7 @@ Use these in `start_command` and `[servers.X.env]` values:
 ## How It Works
 
 1. **`init`** creates config files and gitignore entries
-2. **`spawn`** creates a git worktree + branch, allocates ports for all servers, loads secrets, starts each server with the resolved environment, and registers the session
+2. **`spawn`** creates a git worktree + branch, allocates ports for all servers, loads secrets, starts each server with the resolved environment, registers the session, and opens a new terminal with Claude Code in the worktree (use `--no-claude` to skip)
 3. **`status`** checks if each server's PID is still alive
 4. **`restart`** kills all servers and starts them fresh with new ports on the same worktree
 5. **`kill --remove`** stops servers, waits for file locks to release, removes the worktree and logs

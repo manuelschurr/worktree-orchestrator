@@ -278,6 +278,67 @@ def substitute_vars(text: str, port_map: dict, current_server: str = "") -> str:
     return text
 
 
+def open_terminal_with_claude(worktree_path: Path, session_name: str):
+    """Open a new terminal window running claude in the worktree directory."""
+    wt_str = str(worktree_path)
+
+    # Strip CLAUDECODE env var so the new terminal isn't detected as a nested session
+    clean_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+    try:
+        if IS_WINDOWS:
+            # Try Windows Terminal first, fall back to cmd
+            wt_check = subprocess.run(
+                ["where", "wt"], capture_output=True, text=True
+            )
+            if wt_check.returncode == 0:
+                subprocess.Popen(
+                    ["wt", "-w", "new", "-d", wt_str,
+                     "--title", f"claude [{session_name}]",
+                     "cmd", "/k", "claude"],
+                    env=clean_env,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            else:
+                subprocess.Popen(
+                    f'start "claude [{session_name}]" cmd /k "cd /d {wt_str} && claude"',
+                    shell=True,
+                    env=clean_env,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+        elif platform.system() == "Darwin":
+            # macOS: use AppleScript to open Terminal.app — unset CLAUDECODE inline
+            script = (
+                f'tell application "Terminal"\n'
+                f'  do script "unset CLAUDECODE && cd {wt_str} && claude"\n'
+                f'  activate\n'
+                f'end tell'
+            )
+            subprocess.Popen(["osascript", "-e", script])
+        else:
+            # Linux: try common terminal emulators
+            for term_cmd in [
+                ["gnome-terminal", "--", "bash", "-c", f"unset CLAUDECODE && cd {wt_str} && claude; exec bash"],
+                ["xfce4-terminal", "-e", f"bash -c 'unset CLAUDECODE && cd {wt_str} && claude; exec bash'"],
+                ["konsole", "-e", "bash", "-c", f"unset CLAUDECODE && cd {wt_str} && claude; exec bash"],
+                ["xterm", "-e", f"bash -c 'unset CLAUDECODE && cd {wt_str} && claude; exec bash'"],
+            ]:
+                try:
+                    subprocess.Popen(term_cmd, env=clean_env)
+                    break
+                except FileNotFoundError:
+                    continue
+            else:
+                print(f"  Could not detect terminal emulator. Run manually:")
+                print(f"    cd {wt_str} && claude")
+                return
+
+        print(f"  Opened new terminal with claude in {wt_str}")
+    except Exception as e:
+        print(f"  Could not open terminal: {e}")
+        print(f"  Run manually: cd {wt_str} && claude")
+
+
 def _rmtree_robust(path: Path, retries: int = 3, delay: float = 1.0):
     """Remove a directory tree with retry logic for Windows file locks."""
     import shutil
@@ -570,7 +631,11 @@ def cmd_spawn(args):
     for srv in server_records:
         print(f"  {srv['name']:12s} port {srv['port']}  (PID {srv['pid']})")
     print()
-    print(f"Open {wt_path} in your editor to start working.")
+    # Open a new terminal with claude in the worktree
+    if not args.no_claude:
+        open_terminal_with_claude(wt_path, name)
+    else:
+        print(f"Open {wt_path} in your editor to start working.")
 
 
 def cmd_status(args):
@@ -825,6 +890,8 @@ def main():
 
     p_spawn = sub.add_parser("spawn", help="Create a new worktree session")
     p_spawn.add_argument("name", help="Session name (issue number or slug)")
+    p_spawn.add_argument("--no-claude", action="store_true",
+                         help="Don't open a new terminal with claude")
 
     sub.add_parser("status", help="Show all sessions and server health")
 

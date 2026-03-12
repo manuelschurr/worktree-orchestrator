@@ -17,7 +17,7 @@ Manage parallel git worktree sessions - each with its own branch, dev servers, a
 | Command | What it does |
 |---------|-------------|
 | `init` | Creates `.orchestrator.toml`, `.orchestrator/.secrets`, updates `.gitignore` |
-| `spawn <n>` | Creates worktree + branch, starts all servers, registers session |
+| `spawn <n>` | Creates worktree + branch, starts all servers, opens Claude in a new terminal |
 | `status` | Shows all sessions with per-server health (UP/DOWN) |
 | `logs <session> [server]` | Shows server logs. Omit server name to see all. |
 | `kill <session> [--remove]` | Stops all servers. `--remove` also deletes the worktree. |
@@ -31,6 +31,8 @@ Manage parallel git worktree sessions - each with its own branch, dev servers, a
 **Servers can reference each other's ports.** Use `{backend.port}` and `{frontend.port}` in start_command and env overrides. All ports are allocated before any server starts.
 
 **Worktrees are project-scoped.** Created at `../worktrees/<project-name>/<session>`. Different projects never interfere.
+
+**Spawn opens Claude automatically.** After starting servers, `spawn` opens a new terminal window with Claude Code running in the worktree directory. The orchestration terminal stays free for `status`, `logs`, `kill`, etc. Use `--no-claude` to skip this.
 
 **Two files, clean separation:**
 - `.orchestrator.toml` - run config (commands, port wiring, non-secret env). Safe to commit.
@@ -124,7 +126,8 @@ Later steps override earlier ones. Secrets provide the base (DB, API keys), env 
 ## Spawning, Logs, Status, Kill, Cleanup
 
 ```bash
-python "$ORCH" spawn 42              # create session "42"
+python "$ORCH" spawn 42              # create session "42" + open Claude in new terminal
+python "$ORCH" spawn 42 --no-claude  # create session without opening Claude
 python "$ORCH" status                # show all sessions
 python "$ORCH" logs 42               # all server logs
 python "$ORCH" logs 42 backend       # just backend

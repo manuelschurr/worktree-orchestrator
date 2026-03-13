@@ -111,9 +111,15 @@ Use these in `start_command` and `[servers.X.env]` values:
 2. **`spawn`** creates a git worktree + branch, allocates ports for all servers, loads secrets, starts each server with the resolved environment, registers the session, and opens a new terminal with Claude Code in the worktree (use `--no-claude` to skip)
 3. **`status`** checks if each server's PID is still alive
 4. **`restart`** kills all servers and starts them fresh with new ports on the same worktree
-5. **`kill --remove`** stops servers, waits for file locks to release, removes the worktree and logs
+5. **`kill --remove`** stops servers, waits for file locks to release, removes the worktree and logs. If the worktree directory can't be removed (e.g. locked by another process), the session stays in the registry as "stopped" and the command exits non-zero with an actionable error
+
+**`cleanup`** only removes sessions whose worktrees were successfully deleted; locked directories are skipped with a warning.
 
 Worktrees are created at `../worktrees/<project-name>/<session>` so different projects never interfere.
+
+## Dashboard
+
+A companion TUI dashboard is available for interactive multi-project session management. See [worktree-dashboard](https://github.com/manuelschurr/worktree-dashboard).
 
 ## Environment Resolution Order
 

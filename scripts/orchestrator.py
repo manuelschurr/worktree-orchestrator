@@ -30,7 +30,7 @@ if hasattr(sys.stderr, "reconfigure") and sys.stderr.encoding and sys.stderr.enc
 # TOML parser (stdlib-only, supports nested tables)
 # ---------------------------------------------------------------------------
 
-def _parse_toml(text: str) -> dict:
+def parse_toml(text: str) -> dict:
     try:
         import tomllib
         return tomllib.loads(text)
@@ -39,23 +39,48 @@ def _parse_toml(text: str) -> dict:
 
     result = {}
     current_path = []
+    current_array_key = None
+
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
+
+        # [[array.of.tables]]
+        if line.startswith("[[") and line.endswith("]]"):
+            section = line[2:-2].strip()
+            parts = section.split(".")
+            current_array_key = parts[-1]
+            parent = result
+            for part in parts[:-1]:
+                if part not in parent:
+                    parent[part] = {}
+                parent = parent[part]
+            if current_array_key not in parent:
+                parent[current_array_key] = []
+            parent[current_array_key].append({})
+            current_path = parts
+            continue
+
+        # [table]
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1].strip()
             current_path = section.split(".")
+            current_array_key = None
             d = result
             for part in current_path:
                 if part not in d:
                     d[part] = {}
-                d = d[part]
+                elif isinstance(d[part], list):
+                    pass
+                d = d[part] if not isinstance(d[part], list) else d[part][-1]
             continue
+
         if "=" in line:
             key, _, val = line.partition("=")
             key = key.strip()
             val = val.strip()
+            # Strip inline comments
             if "#" in val:
                 in_str = False
                 for i, ch in enumerate(val):
@@ -72,10 +97,16 @@ def _parse_toml(text: str) -> dict:
                 parsed = val.lower() == "true"
             else:
                 parsed = val
+
+            # Navigate to the correct target dict
             d = result
             for part in current_path:
-                d = d[part]
+                if isinstance(d.get(part), list):
+                    d = d[part][-1]
+                else:
+                    d = d[part]
             d[key] = parsed
+
     return result
 
 
@@ -115,7 +146,7 @@ def load_config(repo_root: Path) -> dict:
     if not config_path.exists():
         print(f"Error: {CONFIG_FILENAME} not found. Run 'init' first.", file=sys.stderr)
         sys.exit(1)
-    raw = _parse_toml(config_path.read_text(encoding="utf-8"))
+    raw = parse_toml(config_path.read_text(encoding="utf-8"))
 
     project = raw.get("project", {})
     servers_raw = raw.get("servers", {})
@@ -339,8 +370,11 @@ def open_terminal_with_claude(worktree_path: Path, session_name: str):
         print(f"  Run manually: cd {wt_str} && claude")
 
 
-def _rmtree_robust(path: Path, retries: int = 3, delay: float = 1.0):
-    """Remove a directory tree with retry logic for Windows file locks."""
+def _rmtree_robust(path: Path, retries: int = 3, delay: float = 1.0) -> bool:
+    """Remove a directory tree with retry logic for Windows file locks.
+
+    Returns True if the directory was fully removed, False otherwise.
+    """
     import shutil
 
     def _onerror(func, fpath, exc_info):
@@ -353,12 +387,14 @@ def _rmtree_robust(path: Path, retries: int = 3, delay: float = 1.0):
     for attempt in range(retries):
         try:
             shutil.rmtree(path, onerror=_onerror)
-            return
+            if not path.exists():
+                return True
         except OSError:
-            if attempt < retries - 1:
-                time.sleep(delay)
-            else:
-                print(f"Warning: could not fully remove {path} after {retries} attempts.", file=sys.stderr)
+            pass
+        if attempt < retries - 1:
+            time.sleep(delay)
+    print(f"Warning: could not fully remove {path} after {retries} attempts.", file=sys.stderr)
+    return False
 
 
 def is_valid_worktree(repo_root: Path, wt_path: Path) -> bool:
@@ -732,13 +768,21 @@ def cmd_kill(args):
                 ["git", "worktree", "remove", str(wt), "--force"],
                 cwd=repo_root, capture_output=True, text=True
             )
-            if result.returncode == 0:
-                print("Worktree removed.")
-            else:
+            if result.returncode != 0:
                 print(f"git worktree remove failed, falling back to manual removal...")
                 _rmtree_robust(wt)
                 subprocess.run(["git", "worktree", "prune"], cwd=repo_root)
-                print("Worktree removed (manual).")
+
+        if wt.exists():
+            # Directory is still locked — don't remove from registry
+            s["status"] = "stopped"
+            save_sessions(repo_root, sessions)
+            print(f"Error: could not remove worktree directory {wt}.", file=sys.stderr)
+            print(f"The directory is likely locked by another process (editor, terminal, Claude Code).", file=sys.stderr)
+            print(f"Close anything using that directory, then retry.", file=sys.stderr)
+            sys.exit(1)
+
+        print("Worktree removed.")
         log_dir = orch_dir(repo_root) / LOGS_DIR / name
         if log_dir.exists():
             _rmtree_robust(log_dir)
@@ -858,24 +902,41 @@ def cmd_cleanup(args):
             print("Aborted.")
             return
 
+    succeeded = []
+    failed = []
     for name, s in stopped.items():
         wt = Path(s["worktree"])
         if wt.exists():
             print(f"Removing worktree {wt}...")
-            subprocess.run(
+            result = subprocess.run(
                 ["git", "worktree", "remove", str(wt), "--force"],
-                cwd=repo_root
+                cwd=repo_root, capture_output=True, text=True
             )
-        log_dir = orch_dir(repo_root) / LOGS_DIR / name
-        if log_dir.exists():
-            _rmtree_robust(log_dir)
+            if result.returncode != 0:
+                print(f"git worktree remove failed, falling back to manual removal...")
+                _rmtree_robust(wt)
 
-    for name in stopped:
+        if wt.exists():
+            print(f"Warning: could not remove {wt} — directory likely locked by another process.", file=sys.stderr)
+            sessions[name]["status"] = "stopped"
+            failed.append(name)
+        else:
+            print(f"Worktree removed: {name}")
+            log_dir = orch_dir(repo_root) / LOGS_DIR / name
+            if log_dir.exists():
+                _rmtree_robust(log_dir)
+            succeeded.append(name)
+
+    for name in succeeded:
         del sessions[name]
     save_sessions(repo_root, sessions)
 
-    subprocess.run(["git", "worktree", "prune"], cwd=repo_root)
-    print("Cleanup complete.")
+    subprocess.run(["git", "worktree", "prune"], cwd=repo_root, capture_output=True)
+    if succeeded:
+        print(f"Cleaned up {len(succeeded)} session(s).")
+    if failed:
+        print(f"Failed to remove {len(failed)} session(s): {', '.join(failed)}", file=sys.stderr)
+        print("Close editors/terminals using those directories, then retry.", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

@@ -595,6 +595,7 @@ def cmd_spawn(args):
             shell=True,
             cwd=str(cwd),
             env=proc_env,
+            stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS else {})
@@ -722,10 +723,7 @@ def cmd_kill(args):
     if IS_WINDOWS and args.remove:
         time.sleep(1.5)
 
-    s["status"] = "stopped"
-    save_sessions(repo_root, sessions)
-
-    # Phase 3: Remove worktree and logs
+    # Phase 3: Remove worktree, logs, and registry entry
     if args.remove:
         wt = Path(s["worktree"])
         if wt.exists():
@@ -744,6 +742,11 @@ def cmd_kill(args):
         log_dir = orch_dir(repo_root) / LOGS_DIR / name
         if log_dir.exists():
             _rmtree_robust(log_dir)
+        del sessions[name]
+    else:
+        s["status"] = "stopped"
+
+    save_sessions(repo_root, sessions)
 
 
 def cmd_restart(args):
@@ -807,6 +810,7 @@ def cmd_restart(args):
             shell=True,
             cwd=str(cwd),
             env=proc_env,
+            stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS else {})

@@ -6,6 +6,7 @@ Cross-platform (Windows, macOS, Linux). Python 3.9+ stdlib only.
 """
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -225,6 +226,24 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def deterministic_port(project: str, session: str, server: str,
+                       base: int = 10000, range_size: int = 50000) -> int:
+    """Derive a stable port from (project, session, server).
+
+    Returns the same port every time for the same inputs, so URLs survive
+    restarts.  Falls back to an ephemeral port if the deterministic one is
+    already in use by another process.
+    """
+    key = f"{project}:{session}:{server}"
+    port = base + int(hashlib.md5(key.encode()).hexdigest(), 16) % range_size
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            return find_free_port()
 
 
 def is_process_alive(pid) -> bool:
@@ -595,10 +614,11 @@ def cmd_spawn(args):
             cwd=repo_root, check=True
         )
 
-    # Phase 1: Allocate ALL ports upfront
+    # Phase 1: Allocate ALL ports upfront (deterministic from project+session+server)
+    proj = project_name(repo_root)
     port_map = {}
     for srv_cfg in config["servers"]:
-        port_map[srv_cfg["name"]] = find_free_port()
+        port_map[srv_cfg["name"]] = deterministic_port(proj, name, srv_cfg["name"])
 
     # Phase 2: Load secrets once (shared across all servers)
     secrets = load_secrets(repo_root)
@@ -823,10 +843,11 @@ def cmd_restart(args):
     if IS_WINDOWS:
         time.sleep(1.5)
 
-    # Phase 2: Allocate new ports and restart servers
+    # Phase 2: Allocate ports (deterministic — same as original spawn)
+    proj = project_name(repo_root)
     port_map = {}
     for srv_cfg in config["servers"]:
-        port_map[srv_cfg["name"]] = find_free_port()
+        port_map[srv_cfg["name"]] = deterministic_port(proj, name, srv_cfg["name"])
 
     secrets = load_secrets(repo_root)
 

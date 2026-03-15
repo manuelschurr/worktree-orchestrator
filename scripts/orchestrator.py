@@ -351,6 +351,46 @@ def is_process_alive(pid) -> bool:
         return False
 
 
+def get_alive_pids(pids) -> set:
+    """Batch-check which PIDs are alive. Returns the set of alive PIDs.
+
+    On Windows, calls tasklist once and parses all PIDs from the output,
+    avoiding the ~0.5s overhead per individual tasklist call.
+    """
+    pids = {int(p) for p in pids if p is not None}
+    if not pids:
+        return set()
+    if IS_WINDOWS:
+        try:
+            result = subprocess.run(
+                ["tasklist", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=10,
+            )
+            alive = set()
+            for line in result.stdout.splitlines():
+                parts = line.split('"')
+                # CSV format: "name","pid","session","session#","mem"
+                if len(parts) >= 4:
+                    try:
+                        p = int(parts[3])
+                        if p in pids:
+                            alive.add(p)
+                    except ValueError:
+                        continue
+            return alive
+        except (OSError, subprocess.TimeoutExpired):
+            return set()
+    else:
+        alive = set()
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                alive.add(pid)
+            except (OSError, ProcessLookupError):
+                pass
+        return alive
+
+
 def kill_process(pid):
     if pid is None:
         return

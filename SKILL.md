@@ -1,6 +1,6 @@
 ---
 name: worktree-orchestrator
-description: Orchestrate parallel Claude Code sessions across git worktrees with multi-server support, cross-server port references, and secrets management. Trigger this skill whenever the user wants to spin up parallel worktrees, manage multiple feature branches simultaneously, run dev servers (frontend, backend, or both) for different branches, spawn a worktree for a GitHub issue, check status of running sessions, view server logs, clean up finished worktrees, or says things like "spawn a worktree", "start a parallel session", "work on issue X in a new worktree", "show my active worktrees", "kill that session", "show me the logs", "clean up worktrees", or "set up the orchestrator". Also trigger when the user mentions working on multiple features in parallel or references ".orchestrator" config.
+description: Orchestrate parallel Claude Code sessions across git worktrees with multi-server support, cross-server port references, stable hostname-based URLs via reverse proxy, and secrets management. Trigger this skill whenever the user wants to spin up parallel worktrees, manage multiple feature branches simultaneously, run dev servers (frontend, backend, or both) for different branches, spawn a worktree for a GitHub issue, check status of running sessions, view server logs, clean up finished worktrees, start the reverse proxy, or says things like "spawn a worktree", "start a parallel session", "work on issue X in a new worktree", "show my active worktrees", "kill that session", "show me the logs", "clean up worktrees", "set up the orchestrator", or "start the proxy". Also trigger when the user mentions working on multiple features in parallel or references ".orchestrator" config.
 ---
 
 # Worktree Orchestrator
@@ -21,12 +21,13 @@ Manage parallel git worktree sessions - each with its own branch, dev servers, a
 | `status` | Shows all sessions with per-server health (UP/DOWN) |
 | `logs <session> [server]` | Shows server logs. Omit server name to see all. |
 | `kill <session> [--remove]` | Stops all servers. `--remove` also deletes the worktree. |
-| `restart <session>` | Stops all servers and starts them again with fresh ports |
+| `restart <session>` | Stops all servers and restarts with same deterministic ports |
 | `cleanup [--force]` | Removes all stopped sessions and their worktrees |
+| `proxy [-p PORT]` | Runs the reverse proxy (default port 1337). Start once, serves all projects. |
 
 ## Key Design Decisions
 
-**Ports are auto-assigned by the OS.** No port ranges, no manual allocation, no collisions across projects.
+**Ports are deterministic.** Derived from a hash of `project:session:server`, so the same session always gets the same ports across restarts. No port ranges to configure, no collisions across projects. Falls back to an OS-assigned ephemeral port if the deterministic one is occupied.
 
 **Servers can reference each other's ports.** Use `{backend.port}` and `{frontend.port}` in start_command and env overrides. All ports are allocated before any server starts.
 
@@ -123,6 +124,36 @@ For each server, the process environment is built as:
 
 Later steps override earlier ones. Secrets provide the base (DB, API keys), env overrides wire up the dynamic ports.
 
+## Reverse Proxy (Stable Hostnames)
+
+Sessions get stable, human-readable `.localhost` hostnames via a built-in reverse proxy. Instead of remembering `localhost:39070`, open `http://b1.myapp.localhost:1337`.
+
+**Hostname convention:**
+
+| Pattern | Example | Routes to |
+|---------|---------|-----------|
+| `{session}.{project}.localhost` | `b1.myapp.localhost` | First server (shortcut) |
+| `{session}-{server}.{project}.localhost` | `b1-frontend.myapp.localhost` | Specific server |
+| `{session}-{server}.{project}.localhost` | `b1-backend.myapp.localhost` | Specific server |
+
+**How it works:**
+
+1. `spawn` and `restart` register hostname→port mappings in `~/.orchestrator/routes.json`
+2. `kill` and `cleanup` remove them
+3. The proxy reads this routes file on each request and forwards by `Host` header
+4. `.localhost` resolves to `127.0.0.1` automatically in Chrome/Edge/Firefox (RFC 6761) — no hosts file or DNS config needed
+
+**The proxy auto-starts.** `spawn` and `restart` launch it as a detached background process if not already running. It's idempotent — multiple calls safely detect the existing instance via port check. You can also start it manually:
+
+```bash
+python "$ORCH" proxy            # listens on port 1337
+python "$ORCH" proxy -p 8080    # custom port
+```
+
+The proxy serves all projects — routes are shared in `~/.orchestrator/routes.json`. Spawn/kill/restart in any project automatically updates the route table.
+
+The proxy rewrites the `Host` header to `localhost:{port}` so backends accept the request, and adds `X-Forwarded-Host` with the original hostname. Raw TCP piping after headers means WebSocket, HMR, and SSE work transparently.
+
 ## Spawning, Logs, Status, Kill, Cleanup
 
 ```bash
@@ -133,8 +164,9 @@ python "$ORCH" logs 42               # all server logs
 python "$ORCH" logs 42 backend       # just backend
 python "$ORCH" kill 42               # stop servers
 python "$ORCH" kill 42 --remove      # stop + delete worktree
-python "$ORCH" restart 42            # stop + restart with fresh ports
+python "$ORCH" restart 42            # stop + restart with same deterministic ports
 python "$ORCH" cleanup --force       # remove all stopped sessions
+python "$ORCH" proxy                 # start the reverse proxy (port 1337)
 ```
 
 ## Config Reference

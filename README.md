@@ -7,10 +7,11 @@ Supports multi-server setups where servers need to know each other's ports (e.g.
 ## Features
 
 - **Auto-launch Claude Code** — `spawn` opens a new terminal with Claude running in the worktree directory
-- **Auto-assigned ports** — no port ranges, no manual allocation, no collisions
+- **Deterministic ports** — derived from project/session/server names, stable across restarts
+- **Stable hostname URLs** — built-in reverse proxy maps `b1-frontend.myapp.localhost:1337` to the right port, so you can bookmark URLs that never change
 - **Cross-server port references** — use `{backend.port}` in frontend config and vice versa
 - **Secrets management** — `.orchestrator/.secrets` (gitignored) loaded into every server's environment
-- **Session lifecycle** — spawn, status, logs, kill, restart, cleanup
+- **Session lifecycle** — spawn, status, logs, kill, restart, cleanup, proxy
 - **Cross-platform** — Windows Terminal, macOS Terminal.app, Linux terminal emulators
 - **Zero dependencies** — Python 3.9+ stdlib only
 
@@ -59,8 +60,9 @@ git clone https://github.com/manuelschurr/worktree-orchestrator.git
 | `status` | Shows all sessions with per-server health (UP/DOWN) |
 | `logs <session> [server]` | Shows server logs. Omit server name to see all. |
 | `kill <session> [--remove]` | Stops all servers. `--remove` also deletes the worktree. |
-| `restart <session>` | Stops all servers and starts them again with fresh ports |
+| `restart <session>` | Stops all servers and restarts with same deterministic ports |
 | `cleanup [--force]` | Removes all stopped sessions and their worktrees |
+| `proxy [-p PORT]` | Runs the reverse proxy (default port 1337) |
 
 ## Example Config
 
@@ -100,18 +102,34 @@ Use these in `start_command` and `[servers.X.env]` values:
 
 | Placeholder | Resolves to |
 |-------------|-------------|
-| `{port}` | The current server's own auto-assigned port |
+| `{port}` | The current server's own deterministic port |
 | `{backend.port}` | The server named "backend"'s port |
 | `{frontend.port}` | The server named "frontend"'s port |
 | `{<name>.port}` | Any server's port, by its section name |
 
+## Reverse Proxy
+
+The orchestrator includes a built-in reverse proxy that gives each server a stable, human-readable hostname. The proxy starts automatically in the background on first `spawn` or `restart` — no manual setup needed. It's idempotent: multiple launches safely detect the existing instance via port check.
+
+You can also start it manually if needed:
+
+```bash
+python orchestrator.py proxy            # default port 1337
+python orchestrator.py proxy -p 8080    # custom port
+```
+
+Hostnames follow the convention `{session}-{server}.{project}.localhost` (e.g. `b1-frontend.myapp.localhost:1337`), with a shortcut `{session}.{project}.localhost` for the first server. Routes are registered automatically on spawn/restart and removed on kill/cleanup via a shared `~/.orchestrator/routes.json` file.
+
+`.localhost` resolves to `127.0.0.1` automatically in Chrome, Edge, and Firefox — no hosts file or DNS config needed.
+
 ## How It Works
 
 1. **`init`** creates config files and gitignore entries
-2. **`spawn`** creates a git worktree + branch, allocates ports for all servers, loads secrets, starts each server with the resolved environment, registers the session, and opens a new terminal with Claude Code in the worktree (use `--no-claude` to skip)
+2. **`spawn`** creates a git worktree + branch, allocates deterministic ports for all servers, loads secrets, starts each server with the resolved environment, registers the session and proxy routes, and opens a new terminal with Claude Code in the worktree (use `--no-claude` to skip)
 3. **`status`** checks if each server's PID is still alive
-4. **`restart`** kills all servers and starts them fresh with new ports on the same worktree
-5. **`kill --remove`** stops servers, waits for file locks to release, removes the worktree and logs. If the worktree directory can't be removed (e.g. locked by another process), the session stays in the registry as "stopped" and the command exits non-zero with an actionable error
+4. **`restart`** kills all servers and restarts them with the same deterministic ports on the same worktree
+5. **`kill --remove`** stops servers, removes proxy routes, waits for file locks to release, removes the worktree and logs. If the worktree directory can't be removed (e.g. locked by another process), the session stays in the registry as "stopped" and the command exits non-zero with an actionable error
+6. **`proxy`** runs the reverse proxy daemon — reads `~/.orchestrator/routes.json` and forwards requests by hostname
 
 **`cleanup`** only removes sessions whose worktrees were successfully deleted; locked directories are skipped with a warning.
 
@@ -119,7 +137,7 @@ Worktrees are created at `../worktrees/<project-name>/<session>` so different pr
 
 ## Dashboard
 
-A companion TUI dashboard is available for interactive multi-project session management. See [worktree-dashboard](https://github.com/manuelschurr/worktree-dashboard).
+A companion TUI dashboard is available for interactive multi-project session management. See [worktree-dashboard](https://github.com/manuelschurr/worktree-dashboard). Both bundle their own copy of `orchestrator.py` (kept in sync). The reverse proxy and route table (`~/.orchestrator/routes.json`) are shared — sessions spawned from either tool are accessible through the same proxy.
 
 ## Environment Resolution Order
 

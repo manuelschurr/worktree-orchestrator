@@ -6,6 +6,7 @@ Cross-platform (Windows, macOS, Linux). Python 3.9+ stdlib only.
 """
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -121,6 +122,11 @@ STATE_DIR = ".orchestrator"
 SESSIONS_FILE = "sessions.json"
 SECRETS_FILE = ".secrets"
 LOGS_DIR = "logs"
+
+PROXY_DIR = Path.home() / ".orchestrator"
+PROXY_ROUTES_FILE = PROXY_DIR / "routes.json"
+DEFAULT_PROXY_PORT = 1337
+DEFAULT_TLD = "localhost"
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +250,87 @@ def deterministic_port(project: str, session: str, server: str,
             return port
         except OSError:
             return find_free_port()
+
+
+# ---------------------------------------------------------------------------
+# Proxy route management
+# ---------------------------------------------------------------------------
+
+def is_proxy_running(port: int = DEFAULT_PROXY_PORT) -> bool:
+    """Check if something is already listening on the proxy port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+            return False
+        except OSError:
+            return True
+
+
+def ensure_proxy_running(port: int = DEFAULT_PROXY_PORT):
+    """Start the proxy as a detached background process if not already running."""
+    if is_proxy_running(port):
+        return
+    script = Path(__file__).resolve()
+    cmd = [sys.executable, str(script), "proxy", "-p", str(port)]
+    if IS_WINDOWS:
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        DETACHED_PROCESS = 0x00000008
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+        )
+    else:
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+
+def load_proxy_routes() -> dict:
+    """Load the shared proxy route table (~/.orchestrator/routes.json)."""
+    if not PROXY_ROUTES_FILE.exists():
+        return {}
+    try:
+        return json.loads(PROXY_ROUTES_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_proxy_routes(routes: dict):
+    PROXY_DIR.mkdir(parents=True, exist_ok=True)
+    PROXY_ROUTES_FILE.write_text(json.dumps(routes, indent=2), encoding="utf-8")
+
+
+def register_proxy_routes(project: str, session: str, port_map: dict,
+                          tld: str = DEFAULT_TLD):
+    """Register hostname->port mappings for a session's servers."""
+    routes = load_proxy_routes()
+    servers = list(port_map.keys())
+    for srv_name, port in port_map.items():
+        routes[f"{session}-{srv_name}.{project}.{tld}"] = port
+    # Shortcut: session.project.tld -> first server
+    if servers:
+        routes[f"{session}.{project}.{tld}"] = port_map[servers[0]]
+    save_proxy_routes(routes)
+
+
+def unregister_proxy_routes(project: str, session: str,
+                            tld: str = DEFAULT_TLD):
+    """Remove all hostname->port mappings for a session."""
+    routes = load_proxy_routes()
+    suffix = f".{project}.{tld}"
+    to_remove = [h for h in routes
+                 if h.endswith(suffix)
+                 and (h.startswith(f"{session}.") or h.startswith(f"{session}-"))]
+    for h in to_remove:
+        del routes[h]
+    save_proxy_routes(routes)
 
 
 def is_process_alive(pid) -> bool:
@@ -680,13 +767,17 @@ def cmd_spawn(args):
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     save_sessions(repo_root, sessions)
+    register_proxy_routes(proj, name, port_map)
+    ensure_proxy_running()
 
     print()
     print(f"Session '{name}' is ready:")
     print(f"  Branch:    {branch}")
     print(f"  Worktree:  {wt_path}")
     for srv in server_records:
-        print(f"  {srv['name']:12s} port {srv['port']}  (PID {srv['pid']})")
+        hostname = f"{name}-{srv['name']}.{proj}.{DEFAULT_TLD}"
+        print(f"  {srv['name']:12s} http://{hostname}:{DEFAULT_PROXY_PORT}  (PID {srv['pid']})")
+    print(f"  {'shortcut':12s} http://{name}.{proj}.{DEFAULT_TLD}:{DEFAULT_PROXY_PORT}")
     print()
     # Open a new terminal with claude in the worktree
     if not args.no_claude:
@@ -811,6 +902,7 @@ def cmd_kill(args):
         s["status"] = "stopped"
 
     save_sessions(repo_root, sessions)
+    unregister_proxy_routes(project_name(repo_root), name)
 
 
 def cmd_restart(args):
@@ -894,13 +986,17 @@ def cmd_restart(args):
     s["ports"] = port_map
     s["status"] = "running"
     save_sessions(repo_root, sessions)
+    register_proxy_routes(proj, name, port_map)
+    ensure_proxy_running()
 
     print()
     print(f"Session '{name}' restarted:")
     print(f"  Branch:    {s['branch']}")
     print(f"  Worktree:  {wt_path}")
     for srv in server_records:
-        print(f"  {srv['name']:12s} port {srv['port']}  (PID {srv['pid']})")
+        hostname = f"{name}-{srv['name']}.{proj}.{DEFAULT_TLD}"
+        print(f"  {srv['name']:12s} http://{hostname}:{DEFAULT_PROXY_PORT}  (PID {srv['pid']})")
+    print(f"  {'shortcut':12s} http://{name}.{proj}.{DEFAULT_TLD}:{DEFAULT_PROXY_PORT}")
 
 
 def cmd_cleanup(args):
@@ -948,8 +1044,10 @@ def cmd_cleanup(args):
                 _rmtree_robust(log_dir)
             succeeded.append(name)
 
+    proj = project_name(repo_root)
     for name in succeeded:
         del sessions[name]
+        unregister_proxy_routes(proj, name)
     save_sessions(repo_root, sessions)
 
     subprocess.run(["git", "worktree", "prune"], cwd=repo_root, capture_output=True)
@@ -958,6 +1056,148 @@ def cmd_cleanup(args):
     if failed:
         print(f"Failed to remove {len(failed)} session(s): {', '.join(failed)}", file=sys.stderr)
         print("Close editors/terminals using those directories, then retry.", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Reverse proxy
+# ---------------------------------------------------------------------------
+
+async def _proxy_connection(reader, writer, routes):
+    """Handle one proxied connection: read headers, route by Host, pipe."""
+    try:
+        # Read until end of HTTP headers
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = await asyncio.wait_for(reader.read(8192), timeout=30)
+            if not chunk:
+                writer.close()
+                return
+            buf += chunk
+
+        header_end = buf.index(b"\r\n\r\n")
+        header_bytes = buf[:header_end]
+        rest = buf[header_end:]  # \r\n\r\n + any body bytes
+
+        # Extract Host header
+        host = None
+        for line in header_bytes.split(b"\r\n"):
+            if line.lower().startswith(b"host:"):
+                host = line.split(b":", 1)[1].strip().decode("latin-1")
+                if ":" in host:
+                    host = host.rsplit(":", 1)[0]
+                break
+
+        if not host or host not in routes:
+            body = f"No route for host: {host}\n".encode()
+            resp = (f"HTTP/1.1 404 Not Found\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Content-Type: text/plain\r\n\r\n").encode() + body
+            writer.write(resp)
+            await writer.drain()
+            writer.close()
+            return
+
+        target_port = routes[host]
+
+        # Connect to upstream server (localhost resolves to IPv4 or IPv6)
+        try:
+            be_reader, be_writer = await asyncio.open_connection(
+                "localhost", target_port)
+        except (ConnectionRefusedError, OSError):
+            body = f"Server on port {target_port} is not responding.\n".encode()
+            resp = (f"HTTP/1.1 502 Bad Gateway\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"Content-Type: text/plain\r\n\r\n").encode() + body
+            writer.write(resp)
+            await writer.drain()
+            writer.close()
+            return
+
+        # Rewrite Host header so backends accept the request, keep original
+        # as X-Forwarded-Host.
+        lines = header_bytes.split(b"\r\n")
+        new_lines = []
+        forwarded_added = False
+        for line in lines:
+            if line.lower().startswith(b"host:"):
+                new_lines.append(f"Host: localhost:{target_port}".encode("latin-1"))
+                new_lines.append(f"X-Forwarded-Host: {host}".encode("latin-1"))
+                forwarded_added = True
+            else:
+                new_lines.append(line)
+        be_writer.write(b"\r\n".join(new_lines) + rest)
+        await be_writer.drain()
+
+        # Bidirectional pipe (handles WebSocket, SSE, chunked, etc.)
+        async def pipe(src, dst):
+            try:
+                while True:
+                    data = await src.read(65536)
+                    if not data:
+                        break
+                    dst.write(data)
+                    await dst.drain()
+            except (ConnectionError, asyncio.CancelledError, OSError):
+                pass
+            finally:
+                try:
+                    dst.close()
+                except Exception:
+                    pass
+
+        await asyncio.gather(pipe(reader, be_writer), pipe(be_reader, writer))
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        pass
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+def cmd_proxy(args):
+    """Run the reverse proxy daemon."""
+    port = getattr(args, "port", DEFAULT_PROXY_PORT)
+    routes = {}
+    routes_mtime = 0.0
+
+    def reload_routes():
+        nonlocal routes, routes_mtime
+        try:
+            st = PROXY_ROUTES_FILE.stat()
+            if st.st_mtime != routes_mtime:
+                routes.clear()
+                routes.update(load_proxy_routes())
+                routes_mtime = st.st_mtime
+                print(f"Routes reloaded ({len(routes)} entries)")
+                for h in sorted(routes):
+                    print(f"  http://{h}:{port} -> 127.0.0.1:{routes[h]}")
+        except FileNotFoundError:
+            if routes:
+                routes.clear()
+                print("Routes file removed — no routes active")
+
+    async def handle(reader, writer):
+        reload_routes()
+        await _proxy_connection(reader, writer, routes)
+
+    async def run():
+        reload_routes()
+        try:
+            server = await asyncio.start_server(handle, "127.0.0.1", port)
+        except OSError as e:
+            print(f"Error: cannot bind to port {port}: {e}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Proxy listening on http://127.0.0.1:{port}")
+        print(f"Routes file: {PROXY_ROUTES_FILE}")
+        print()
+        async with server:
+            await server.serve_forever()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("\nProxy stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1239,10 @@ def main():
     p_cleanup = sub.add_parser("cleanup", help="Remove stopped sessions and worktrees")
     p_cleanup.add_argument("--force", action="store_true", help="Skip confirmation")
 
+    p_proxy = sub.add_parser("proxy", help="Run the reverse proxy daemon")
+    p_proxy.add_argument("-p", "--port", type=int, default=DEFAULT_PROXY_PORT,
+                         help=f"Port to listen on (default: {DEFAULT_PROXY_PORT})")
+
     args = parser.parse_args()
     commands = {
         "init": cmd_init,
@@ -1008,6 +1252,7 @@ def main():
         "kill": cmd_kill,
         "restart": cmd_restart,
         "cleanup": cmd_cleanup,
+        "proxy": cmd_proxy,
     }
     commands[args.command](args)
 

@@ -125,8 +125,53 @@ LOGS_DIR = "logs"
 
 PROXY_DIR = Path.home() / ".orchestrator"
 PROXY_ROUTES_FILE = PROXY_DIR / "routes.json"
+ACCESS_FILE = PROXY_DIR / "access.json"
 DEFAULT_PROXY_PORT = 1337
 DEFAULT_TLD = "localhost"
+
+def _tld():    return os.environ.get("ORCH_TLD", DEFAULT_TLD)
+def _scheme(): return os.environ.get("ORCH_SCHEME", "http")
+def _proxy_port(): return int(os.environ.get("ORCH_PROXY_PORT", str(DEFAULT_PROXY_PORT)))
+
+def _url_port_suffix():
+    v = os.environ.get("ORCH_URL_PORT")
+    if v is None:
+        return f":{_proxy_port()}"
+    return "" if v == "" else f":{v}"
+
+def host_for(session, server, project, *, primary=False):
+    tld = _tld()
+    return f"{session}.{project}.{tld}" if primary else f"{session}-{server}.{project}.{tld}"
+
+def proxy_url(session, server, project, *, primary=False):
+    return f"{_scheme()}://{host_for(session, server, project, primary=primary)}{_url_port_suffix()}"
+
+
+def should_record_access(prev_iso, now_dt, min_seconds=30):
+    if not prev_iso:
+        return True
+    try:
+        prev = datetime.fromisoformat(prev_iso)
+    except ValueError:
+        return True
+    return (now_dt - prev).total_seconds() >= min_seconds
+
+
+def _load_access():
+    if not ACCESS_FILE.exists():
+        return {}
+    try:
+        return json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def record_access(host, now_dt):
+    data = _load_access()
+    if should_record_access(data.get(host), now_dt):
+        data[host] = now_dt.isoformat()
+        PROXY_DIR.mkdir(parents=True, exist_ok=True)
+        ACCESS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -168,14 +213,16 @@ def load_config(repo_root: Path) -> dict:
         servers.append({
             "name": name,
             "start_command": cmd,
+            "setup_command": cfg.get("setup_command", ""),
             "directory": cfg.get("directory", ""),
+            "primary": bool(cfg.get("primary", False)),
             "env": {k: v for k, v in cfg.get("env", {}).items() if isinstance(v, str)},
         })
 
     return {
         "remote": project.get("remote", "origin"),
         "base_branch": project.get("base_branch", "main"),
-        "branch_prefix": project.get("branch_prefix", "feature/issue-"),
+        "branch_prefix": project.get("branch_prefix", "b"),
         "servers": servers,
     }
 
@@ -307,24 +354,30 @@ def save_proxy_routes(routes: dict):
     PROXY_ROUTES_FILE.write_text(json.dumps(routes, indent=2), encoding="utf-8")
 
 
-def register_proxy_routes(project: str, session: str, port_map: dict,
-                          tld: str = DEFAULT_TLD):
-    """Register hostname->port mappings for a session's servers."""
+def register_proxy_routes(project, session, port_map, primary_server=None):
+    """Register hostname->port mappings for a session's servers.
+
+    If primary_server is set, the bare `{session}.{project}.{tld}` host points to
+    it and that server gets NO `{session}-{server}` host. Otherwise every server
+    gets a `{session}-{server}` host and the bare host points to the first server.
+    """
     routes = load_proxy_routes()
     servers = list(port_map.keys())
     for srv_name, port in port_map.items():
-        routes[f"{session}-{srv_name}.{project}.{tld}"] = port
-    # Shortcut: session.project.tld -> first server
-    if servers:
-        routes[f"{session}.{project}.{tld}"] = port_map[servers[0]]
+        if srv_name == primary_server:
+            continue  # primary uses the bare host only
+        routes[host_for(session, srv_name, project)] = port
+    if primary_server and primary_server in port_map:
+        routes[host_for(session, primary_server, project, primary=True)] = port_map[primary_server]
+    elif servers:
+        routes[host_for(session, servers[0], project, primary=True)] = port_map[servers[0]]
     save_proxy_routes(routes)
 
 
-def unregister_proxy_routes(project: str, session: str,
-                            tld: str = DEFAULT_TLD):
+def unregister_proxy_routes(project: str, session: str):
     """Remove all hostname->port mappings for a session."""
     routes = load_proxy_routes()
-    suffix = f".{project}.{tld}"
+    suffix = f".{project}.{_tld()}"
     to_remove = [h for h in routes
                  if h.endswith(suffix)
                  and (h.startswith(f"{session}.") or h.startswith(f"{session}-"))]
@@ -441,23 +494,68 @@ def worktree_base_dir(repo_root: Path) -> Path:
     return (repo_root.parent / "worktrees" / project_name(repo_root)).resolve()
 
 
-def substitute_vars(text: str, port_map: dict, current_server: str = "") -> str:
-    """Replace port placeholders in a string.
+def substitute_vars(text: str, port_map: dict, current_server: str = "",
+                    project: str = "", session: str = "",
+                    primary_server: str = None) -> str:
+    """Replace port and URL placeholders in a string.
 
     Supports:
-      {port}             - current server's own port
-      {servername.port}  - named server's port
+      {port}                  - current server's own port
+      {servername.port}       - named server's port
+      {url}                   - current server's proxy URL
+      {servername.url}        - named server's proxy URL
     """
     for srv_name, port in port_map.items():
         text = text.replace(f"{{{srv_name}.port}}", str(port))
+        if project and session:
+            url = proxy_url(session, srv_name, project, primary=(srv_name == primary_server))
+            text = text.replace(f"{{{srv_name}.url}}", url)
     if current_server and current_server in port_map:
         text = text.replace("{port}", str(port_map[current_server]))
+        if project and session:
+            text = text.replace("{url}",
+                proxy_url(session, current_server, project, primary=(current_server == primary_server)))
     return text
+
+
+def run_setup_command(setup_cmd: str, cwd: Path, env: dict,
+                      log_handle, srv_name: str) -> bool:
+    """Run a server's setup_command before its start_command.
+
+    Runs synchronously in the server's working directory and environment.
+    Output is captured into the already-open server log handle, framed by
+    `=== setup ===` markers. Returns True on success (exit 0, or no setup
+    command configured), False if the command exited non-zero.
+    """
+    if not setup_cmd:
+        return True
+    print(f"  Running setup for {srv_name}: {setup_cmd}")
+    log_handle.write(f"=== setup: {setup_cmd} ===\n")
+    log_handle.flush()
+    result = subprocess.run(
+        setup_cmd,
+        shell=True,
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    log_handle.write(f"=== setup exited {result.returncode} ===\n")
+    log_handle.flush()
+    if result.returncode != 0:
+        log_path = getattr(log_handle, "name", "the server log")
+        print(f"  ERROR: setup for {srv_name} failed (exit {result.returncode}). "
+              f"Server not started.", file=sys.stderr)
+        print(f"  See {log_path}", file=sys.stderr)
+        return False
+    return True
 
 
 def open_terminal_with_claude(worktree_path: Path, session_name: str):
     """Open a new terminal window running claude in the worktree directory."""
     wt_str = str(worktree_path)
+    claude_cmd = "claude --dangerously-skip-permissions"
 
     # Strip CLAUDECODE env var so the new terminal isn't detected as a nested session
     clean_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
@@ -472,13 +570,13 @@ def open_terminal_with_claude(worktree_path: Path, session_name: str):
                 subprocess.Popen(
                     ["wt", "-w", "new", "-d", wt_str,
                      "--title", f"claude [{session_name}]",
-                     "cmd", "/k", "claude"],
+                     "cmd", "/k", claude_cmd],
                     env=clean_env,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 )
             else:
                 subprocess.Popen(
-                    f'start "claude [{session_name}]" cmd /k "cd /d {wt_str} && claude"',
+                    f'start "claude [{session_name}]" cmd /k "cd /d {wt_str} && {claude_cmd}"',
                     shell=True,
                     env=clean_env,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
@@ -487,7 +585,7 @@ def open_terminal_with_claude(worktree_path: Path, session_name: str):
             # macOS: use AppleScript to open Terminal.app — unset CLAUDECODE inline
             script = (
                 f'tell application "Terminal"\n'
-                f'  do script "unset CLAUDECODE && cd {wt_str} && claude"\n'
+                f'  do script "unset CLAUDECODE && cd {wt_str} && {claude_cmd}"\n'
                 f'  activate\n'
                 f'end tell'
             )
@@ -495,10 +593,10 @@ def open_terminal_with_claude(worktree_path: Path, session_name: str):
         else:
             # Linux: try common terminal emulators
             for term_cmd in [
-                ["gnome-terminal", "--", "bash", "-c", f"unset CLAUDECODE && cd {wt_str} && claude; exec bash"],
-                ["xfce4-terminal", "-e", f"bash -c 'unset CLAUDECODE && cd {wt_str} && claude; exec bash'"],
-                ["konsole", "-e", "bash", "-c", f"unset CLAUDECODE && cd {wt_str} && claude; exec bash"],
-                ["xterm", "-e", f"bash -c 'unset CLAUDECODE && cd {wt_str} && claude; exec bash'"],
+                ["gnome-terminal", "--", "bash", "-c", f"unset CLAUDECODE && cd {wt_str} && {claude_cmd}; exec bash"],
+                ["xfce4-terminal", "-e", f"bash -c 'unset CLAUDECODE && cd {wt_str} && {claude_cmd}; exec bash'"],
+                ["konsole", "-e", "bash", "-c", f"unset CLAUDECODE && cd {wt_str} && {claude_cmd}; exec bash"],
+                ["xterm", "-e", f"bash -c 'unset CLAUDECODE && cd {wt_str} && {claude_cmd}; exec bash'"],
             ]:
                 try:
                     subprocess.Popen(term_cmd, env=clean_env)
@@ -507,13 +605,13 @@ def open_terminal_with_claude(worktree_path: Path, session_name: str):
                     continue
             else:
                 print(f"  Could not detect terminal emulator. Run manually:")
-                print(f"    cd {wt_str} && claude")
+                print(f"    cd {wt_str} && {claude_cmd}")
                 return
 
         print(f"  Opened new terminal with claude in {wt_str}")
     except Exception as e:
         print(f"  Could not open terminal: {e}")
-        print(f"  Run manually: cd {wt_str} && claude")
+        print(f"  Run manually: cd {wt_str} && {claude_cmd}")
 
 
 def _rmtree_robust(path: Path, retries: int = 3, delay: float = 1.0) -> bool:
@@ -611,7 +709,7 @@ def cmd_init(args):
     [project]
     remote = "origin"
     base_branch = "{base}"
-    branch_prefix = "feature/issue-"
+    branch_prefix = "b"
 
     # -------------------------------------------------------------------
     # Servers
@@ -619,8 +717,14 @@ def cmd_init(args):
     # Define one [servers.<name>] section per process your project needs.
     # Ports are auto-assigned. Use these placeholders in start_command and env values:
     #   {{port}}              - this server's own port
+    #   {{url}}               - this server's proxy URL (e.g. http://b1-web.myapp.localhost:1337)
     #   {{backend.port}}      - the "backend" server's port (use any server name)
+    #   {{backend.url}}       - the "backend" server's proxy URL
     #   {{frontend.port}}     - the "frontend" server's port
+    #   {{frontend.url}}      - the "frontend" server's proxy URL
+    #
+    # NOTE: Use {{*.url}} for CORS, API base URLs, etc. (browsers resolve .localhost fine).
+    # Use http://localhost:{{*.port}} for OAuth redirect URIs (Google rejects .localhost subdomains).
     #
     # Secrets (DATABASE_URL, API keys) go in .orchestrator/.secrets
     # and are loaded into every server's environment automatically.
@@ -629,24 +733,27 @@ def cmd_init(args):
     # -d web-server instead of -d chrome.
     #
     # Optional fields:
-    #   directory = "server"   # subdirectory to run from (default: repo root)
+    #   directory = "server"          # subdirectory to run from (default: repo root)
+    #   setup_command = "npm install" # runs before start_command on every spawn/restart
     #
     # Use [servers.<name>.env] to set/override env vars with port substitution.
 
     # -- Example: Dart Shelf backend --
     # [servers.backend]
+    # setup_command = "dart pub get"
     # start_command = "dart run bin/server.dart"
     # directory = "server"
     #
     # [servers.backend.env]
     # PORT = "{{backend.port}}"
-    # FRONTEND_URL = "http://localhost:{{frontend.port}}"
-    # ALLOWED_ORIGIN = "http://localhost:{{frontend.port}}"
+    # FRONTEND_URL = "{{frontend.url}}"
+    # ALLOWED_ORIGIN = "{{frontend.url}}"
     # DEV_MODE = "true"
 
     # -- Example: Flutter frontend that needs the backend port --
     # [servers.frontend]
-    # start_command = "flutter run -d web-server --web-port={{frontend.port}} --dart-define=API_BASE_URL=http://localhost:{{backend.port}} --dart-define=DEV_MODE=true"
+    # setup_command = "flutter pub get"
+    # start_command = "flutter run -d web-server --web-port={{frontend.port}} --dart-define=API_BASE_URL={{backend.url}} --dart-define=DEV_MODE=true"
 
     # -- Example: simple static site --
     # [servers.web]
@@ -705,21 +812,47 @@ def cmd_spawn(args):
     if fetch.returncode != 0:
         print(f"Warning: could not fetch from {config['remote']}. Using local state.")
 
-    # Create branch if needed
+    # Resolve base_ref once (prefer remote, fall back to local)
+    base_ref = f"{config['remote']}/{config['base_branch']}"
+    verify_base = subprocess.run(
+        ["git", "rev-parse", "--verify", base_ref],
+        capture_output=True, text=True, cwd=repo_root
+    )
+    base_ref_available = verify_base.returncode == 0
+    if not base_ref_available:
+        base_ref = config["base_branch"]
+
+    # Create branch if needed, or fast-forward an existing branch to base_ref
+    # so the new worktree starts on current main rather than a stale commit
+    # left over from a previous session on this slot.
     check = subprocess.run(
         ["git", "rev-parse", "--verify", branch],
         capture_output=True, text=True, cwd=repo_root
     )
     if check.returncode != 0:
-        base_ref = f"{config['remote']}/{config['base_branch']}"
-        verify = subprocess.run(
-            ["git", "rev-parse", "--verify", base_ref],
-            capture_output=True, text=True, cwd=repo_root
-        )
-        if verify.returncode != 0:
-            base_ref = config["base_branch"]
         print(f"Creating branch {branch} from {base_ref}...")
         subprocess.run(["git", "branch", branch, base_ref], cwd=repo_root, check=True)
+    elif base_ref_available:
+        # Only fast-forward when the existing branch is strictly an ancestor
+        # of base_ref — never discard local commits. Skip silently if the
+        # branch is already at base_ref (is-ancestor returns 0 for equal refs).
+        is_ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", branch, base_ref],
+            cwd=repo_root, capture_output=True,
+        )
+        if is_ancestor.returncode == 0:
+            ff = subprocess.run(
+                ["git", "branch", "-f", branch, base_ref],
+                cwd=repo_root, capture_output=True, text=True,
+            )
+            if ff.returncode == 0:
+                print(f"Fast-forwarded {branch} to {base_ref}.")
+            else:
+                # Branch is likely checked out in another worktree.
+                print(f"Warning: could not fast-forward {branch} to {base_ref}: "
+                      f"{ff.stderr.strip() or 'unknown error'}")
+        else:
+            print(f"Branch {branch} has commits not on {base_ref}; leaving as-is.")
 
     # Create worktree
     wt_base.mkdir(parents=True, exist_ok=True)
@@ -749,9 +882,11 @@ def cmd_spawn(args):
 
     # Phase 2: Load secrets once (shared across all servers)
     secrets = load_secrets(repo_root)
+    primary_server = next((s["name"] for s in config["servers"] if s.get("primary")), None)
 
     # Phase 3: Start each server
     server_records = []
+    setup_failed = False
     for srv_cfg in config["servers"]:
         srv_name = srv_cfg["name"]
         port = port_map[srv_name]
@@ -763,15 +898,33 @@ def cmd_spawn(args):
         proc_env = os.environ.copy()
         proc_env.update(secrets)
         for key, val in srv_cfg.get("env", {}).items():
-            proc_env[key] = substitute_vars(val, port_map, srv_name)
+            proc_env[key] = substitute_vars(val, port_map, srv_name, proj, name,
+                                            primary_server=primary_server)
 
         # Substitute ports in start_command
-        cmd = substitute_vars(srv_cfg["start_command"], port_map, srv_name)
+        cmd = substitute_vars(srv_cfg["start_command"], port_map, srv_name, proj, name,
+                              primary_server=primary_server)
 
         log_file = session_logs_dir(repo_root, name) / f"{srv_name}.log"
+        log_handle = open(log_file, "w", encoding="utf-8")
+
+        # Run the setup step (e.g. `dart pub get`) before starting the server.
+        setup_cmd = substitute_vars(srv_cfg.get("setup_command", ""),
+                                    port_map, srv_name, proj, name,
+                                    primary_server=primary_server)
+        if not run_setup_command(setup_cmd, cwd, proc_env, log_handle, srv_name):
+            log_handle.close()
+            setup_failed = True
+            server_records.append({
+                "name": srv_name,
+                "port": port,
+                "pid": None,
+                "command": cmd,
+                "directory": srv_cfg.get("directory", ""),
+            })
+            continue
 
         print(f"Starting {srv_name} on port {port}: {cmd}")
-        log_handle = open(log_file, "w", encoding="utf-8")
 
         proc = subprocess.Popen(
             cmd,
@@ -781,7 +934,8 @@ def cmd_spawn(args):
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
-            **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS else {})
+            **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS
+               else {"start_new_session": True})
         )
 
         server_records.append({
@@ -797,6 +951,7 @@ def cmd_spawn(args):
         print("No servers configured - worktree created without servers.")
 
     # Register session
+    now_iso = datetime.now(timezone.utc).isoformat()
     sessions[name] = {
         "name": name,
         "branch": branch,
@@ -804,10 +959,11 @@ def cmd_spawn(args):
         "servers": server_records,
         "ports": port_map,
         "status": "running",
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": now_iso,
+        "started_at": now_iso,
     }
     save_sessions(repo_root, sessions)
-    register_proxy_routes(proj, name, port_map)
+    register_proxy_routes(proj, name, port_map, primary_server=primary_server)
     ensure_proxy_running()
 
     print()
@@ -815,9 +971,11 @@ def cmd_spawn(args):
     print(f"  Branch:    {branch}")
     print(f"  Worktree:  {wt_path}")
     for srv in server_records:
-        hostname = f"{name}-{srv['name']}.{proj}.{DEFAULT_TLD}"
-        print(f"  {srv['name']:12s} http://{hostname}:{DEFAULT_PROXY_PORT}  (PID {srv['pid']})")
-    print(f"  {'shortcut':12s} http://{name}.{proj}.{DEFAULT_TLD}:{DEFAULT_PROXY_PORT}")
+        is_primary = (srv["name"] == primary_server)
+        if srv["pid"] is None:
+            print(f"  {srv['name']:12s} setup failed - see logs ({srv['name']}.log)")
+        else:
+            print(f"  {srv['name']:12s} {proxy_url(name, srv['name'], proj, primary=is_primary)}  (PID {srv['pid']})")
     print()
     # Open a new terminal with claude in the worktree
     if not args.no_claude:
@@ -825,9 +983,82 @@ def cmd_spawn(args):
     else:
         print(f"Open {wt_path} in your editor to start working.")
 
+    if setup_failed:
+        print()
+        print("Warning: one or more servers failed their setup step and were "
+              "not started. Fix the cause and run 'restart'.", file=sys.stderr)
+        sys.exit(1)
+
+
+def parse_free_mb(text):
+    mem = swap = None
+    for line in text.splitlines():
+        p = line.split()
+        if p and p[0] == "Mem:":
+            mem = p
+        elif p and p[0] == "Swap:":
+            swap = p
+    if not mem:
+        return None
+    return {
+        "total_mb": int(mem[1]), "used_mb": int(mem[2]),
+        "available_mb": int(mem[6]) if len(mem) > 6 else int(mem[3]),
+        "swap_total_mb": int(swap[1]) if swap else 0,
+        "swap_used_mb": int(swap[2]) if swap else 0,
+    }
+
+def read_system_memory():
+    if IS_WINDOWS:
+        return None
+    try:
+        r = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
+        return parse_free_mb(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+def process_rss_mb(pid):
+    if pid is None or IS_WINDOWS:
+        return None
+    try:
+        r = subprocess.run(["ps", "-o", "rss=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=5)
+        out = r.stdout.strip()
+        return round(int(out) / 1024) if out else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def build_status(repo_root):
+    proj = project_name(repo_root)
+    config = load_config(repo_root)
+    primary_server = next((s["name"] for s in config["servers"] if s.get("primary")), None)
+    sessions = load_sessions(repo_root)
+    access = _load_access()
+    out = {"memory": read_system_memory(), "sessions": {}}
+    for name, s in sessions.items():
+        servers = []
+        for srv in s.get("servers", []):
+            is_primary = (srv["name"] == primary_server)
+            servers.append({
+                "name": srv["name"], "port": srv.get("port"), "pid": srv.get("pid"),
+                "up": is_process_alive(srv.get("pid")),
+                "primary": is_primary,
+                "url": proxy_url(name, srv["name"], proj, primary=is_primary),
+                "rss_mb": process_rss_mb(srv.get("pid")),
+                "last_access": access.get(host_for(name, srv["name"], proj, primary=is_primary)),
+            })
+        out["sessions"][name] = {
+            "branch": s.get("branch"), "status": s.get("status"),
+            "worktree": s.get("worktree"), "servers": servers,
+        }
+    return out
+
 
 def cmd_status(args):
     repo_root = find_repo_root()
+    if getattr(args, "json", False):
+        print(json.dumps(build_status(repo_root), indent=2))
+        return
     sessions = load_sessions(repo_root)
 
     if not sessions:
@@ -878,9 +1109,12 @@ def cmd_logs(args):
     for log_file in log_files:
         srv_name = log_file.stem
         lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
-        if len(lines) > n:
+        if n > 0 and len(lines) > n:
             lines = lines[-n:]
-        print(f"--- {srv_name} (last {min(n, len(lines))} lines) ---")
+            header = f"--- {srv_name} (last {len(lines)} lines) ---"
+        else:
+            header = f"--- {srv_name} ({len(lines)} lines) ---"
+        print(header)
         for line in lines:
             print(line)
         print()
@@ -982,8 +1216,10 @@ def cmd_restart(args):
         port_map[srv_cfg["name"]] = deterministic_port(proj, name, srv_cfg["name"])
 
     secrets = load_secrets(repo_root)
+    primary_server = next((sc["name"] for sc in config["servers"] if sc.get("primary")), None)
 
     server_records = []
+    setup_failed = False
     for srv_cfg in config["servers"]:
         srv_name = srv_cfg["name"]
         port = port_map[srv_name]
@@ -993,14 +1229,32 @@ def cmd_restart(args):
         proc_env = os.environ.copy()
         proc_env.update(secrets)
         for key, val in srv_cfg.get("env", {}).items():
-            proc_env[key] = substitute_vars(val, port_map, srv_name)
+            proc_env[key] = substitute_vars(val, port_map, srv_name, proj, name,
+                                            primary_server=primary_server)
 
-        cmd = substitute_vars(srv_cfg["start_command"], port_map, srv_name)
+        cmd = substitute_vars(srv_cfg["start_command"], port_map, srv_name, proj, name,
+                              primary_server=primary_server)
 
         log_file = session_logs_dir(repo_root, name) / f"{srv_name}.log"
+        log_handle = open(log_file, "w", encoding="utf-8")
+
+        # Run the setup step (e.g. `dart pub get`) before starting the server.
+        setup_cmd = substitute_vars(srv_cfg.get("setup_command", ""),
+                                    port_map, srv_name, proj, name,
+                                    primary_server=primary_server)
+        if not run_setup_command(setup_cmd, cwd, proc_env, log_handle, srv_name):
+            log_handle.close()
+            setup_failed = True
+            server_records.append({
+                "name": srv_name,
+                "port": port,
+                "pid": None,
+                "command": cmd,
+                "directory": srv_cfg.get("directory", ""),
+            })
+            continue
 
         print(f"Starting {srv_name} on port {port}: {cmd}")
-        log_handle = open(log_file, "w", encoding="utf-8")
 
         proc = subprocess.Popen(
             cmd,
@@ -1010,7 +1264,8 @@ def cmd_restart(args):
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
-            **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS else {})
+            **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS
+               else {"start_new_session": True})
         )
 
         server_records.append({
@@ -1025,8 +1280,9 @@ def cmd_restart(args):
     s["servers"] = server_records
     s["ports"] = port_map
     s["status"] = "running"
+    s["started_at"] = datetime.now(timezone.utc).isoformat()
     save_sessions(repo_root, sessions)
-    register_proxy_routes(proj, name, port_map)
+    register_proxy_routes(proj, name, port_map, primary_server=primary_server)
     ensure_proxy_running()
 
     print()
@@ -1034,9 +1290,17 @@ def cmd_restart(args):
     print(f"  Branch:    {s['branch']}")
     print(f"  Worktree:  {wt_path}")
     for srv in server_records:
-        hostname = f"{name}-{srv['name']}.{proj}.{DEFAULT_TLD}"
-        print(f"  {srv['name']:12s} http://{hostname}:{DEFAULT_PROXY_PORT}  (PID {srv['pid']})")
-    print(f"  {'shortcut':12s} http://{name}.{proj}.{DEFAULT_TLD}:{DEFAULT_PROXY_PORT}")
+        is_primary = (srv["name"] == primary_server)
+        if srv["pid"] is None:
+            print(f"  {srv['name']:12s} setup failed - see logs ({srv['name']}.log)")
+        else:
+            print(f"  {srv['name']:12s} {proxy_url(name, srv['name'], proj, primary=is_primary)}  (PID {srv['pid']})")
+
+    if setup_failed:
+        print()
+        print("Warning: one or more servers failed their setup step and were "
+              "not started. Fix the cause and run 'restart' again.", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_cleanup(args):
@@ -1137,6 +1401,7 @@ async def _proxy_connection(reader, writer, routes):
             writer.close()
             return
 
+        record_access(host, datetime.now(timezone.utc))
         target_port = routes[host]
 
         # Connect to upstream server (localhost resolves to IPv4 or IPv6)
@@ -1259,14 +1524,15 @@ def main():
     p_spawn.add_argument("--no-claude", action="store_true",
                          help="Don't open a new terminal with claude")
 
-    sub.add_parser("status", help="Show all sessions and server health")
+    p_status = sub.add_parser("status", help="Show all sessions and server health")
+    p_status.add_argument("--json", action="store_true", help="Output status as JSON")
 
     p_logs = sub.add_parser("logs", help="Show server logs")
     p_logs.add_argument("name", help="Session name")
     p_logs.add_argument("server", nargs="?", default=None,
                         help="Server name (omit to show all)")
     p_logs.add_argument("-n", "--lines", type=int, default=50,
-                        help="Lines to show (default: 50)")
+                        help="Lines to show (default: 50; 0 = all)")
 
     p_kill = sub.add_parser("kill", help="Stop all servers in a session")
     p_kill.add_argument("name", help="Session name")

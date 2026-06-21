@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import signal
 import socket
 import subprocess
@@ -445,24 +446,133 @@ def get_alive_pids(pids) -> set:
 
 
 def kill_process(pid):
+    """Stop a server process and its detached children.
+
+    Servers are launched with start_new_session=True, so the recorded PID is a
+    shell wrapper that is its own process-group leader; the real dart/flutter
+    process is a child in that group. Killing only the wrapper PID orphans the
+    child (RAM leak + stale servers), so when `pid` is its own group leader we
+    signal the whole process group. When it is NOT a leader (it shares a group,
+    e.g. with the orchestrator itself), we fall back to the single PID — killing
+    the shared group would take down unrelated processes.
+    """
     if pid is None:
         return
     pid = int(pid)
-    try:
-        if IS_WINDOWS:
+    if IS_WINDOWS:
+        try:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
                            capture_output=True)
+        except OSError:
+            pass
+        return
+
+    try:
+        pgid = os.getpgid(pid)
+    except (OSError, ProcessLookupError):
+        return  # already gone
+    group_kill = (pgid == pid)
+
+    def _alive():
+        if group_kill:
+            try:
+                os.killpg(pgid, 0)
+                return True
+            except (OSError, ProcessLookupError):
+                return False
+        return is_process_alive(pid)
+
+    def _send(sig):
+        if group_kill:
+            os.killpg(pgid, sig)
         else:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(10):
-                time.sleep(0.3)
-                try:
-                    os.kill(pid, 0)
-                except OSError:
-                    return
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, sig)
+
+    try:
+        _send(signal.SIGTERM)
+        for _ in range(10):
+            time.sleep(0.3)
+            if not _alive():
+                return
+        _send(signal.SIGKILL)
     except (OSError, ProcessLookupError):
         pass
+
+
+def parse_ss_listeners(text):
+    """Parse `ss -ltnpH` output into {port: set(pids)}.
+
+    Each line looks like:
+        LISTEN 0 128 0.0.0.0:50022 0.0.0.0:* users:(("dart:server.dar",pid=9302,fd=10))
+    The 4th column is the local address:port; PIDs come from the pid=N fields.
+    """
+    result = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local = parts[3]  # e.g. 0.0.0.0:50022, *:443, [::]:22, 127.0.0.1:1337
+        if ":" not in local:
+            continue
+        try:
+            port = int(local.rsplit(":", 1)[1])
+        except ValueError:
+            continue
+        pids = {int(m) for m in re.findall(r"pid=(\d+)", line)}
+        result.setdefault(port, set()).update(pids)
+    return result
+
+
+def listening_ports_with_pids():
+    """Current TCP listeners as {port: set(pids)} via `ss` (Linux). {} elsewhere
+    or if `ss` is unavailable — callers treat an empty result as 'unknown'."""
+    if IS_WINDOWS:
+        return {}
+    try:
+        r = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True,
+                           timeout=5)
+        return parse_ss_listeners(r.stdout) if r.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+
+
+def verify_servers_stopped(servers):
+    """After killing a session, confirm none of its recorded ports are still
+    listening. Returns [(name, port, set(pids))] for each straggler — an orphan
+    the wrapper-PID kill missed. Best-effort: returns [] when listeners can't be
+    read (so absence of evidence never blocks a kill)."""
+    listeners = listening_ports_with_pids()
+    if not listeners:
+        return []
+    stragglers = []
+    for srv in servers:
+        port = srv.get("port")
+        if port is None:
+            continue
+        pids = listeners.get(int(port))
+        if pids:
+            stragglers.append((srv.get("name"), int(port), set(pids)))
+    return stragglers
+
+
+def reap_stragglers(servers):
+    """Verification step run after a kill: every recorded server port must be
+    free. Reap any orphan still bound to one and report what was found."""
+    stragglers = verify_servers_stopped(servers)
+    for name, port, pids in stragglers:
+        print(f"WARNING: {name} still listening on :{port} after kill "
+              f"(orphan PID(s) {sorted(pids)}); reaping.")
+        for pid in pids:
+            kill_process(pid)
+    if not stragglers:
+        return
+    still = verify_servers_stopped(servers)
+    if still:
+        for name, port, pids in still:
+            print(f"ERROR: :{port} ({name}) still bound by {sorted(pids)} after "
+                  f"reap — manual cleanup needed.", file=sys.stderr)
+    else:
+        print("Verified: all server ports are free.")
 
 
 def detect_base_branch(remote: str) -> str:
@@ -1140,6 +1250,10 @@ def cmd_kill(args):
         else:
             print(f"{srv['name']} already stopped.")
 
+    # Phase 1b: verify only the servers that should be running are — reap any
+    # orphan still bound to a killed server's port.
+    reap_stragglers(s.get("servers", []))
+
     # Phase 2: Wait for file locks to release on Windows
     if IS_WINDOWS and args.remove:
         time.sleep(1.5)
@@ -1205,6 +1319,10 @@ def cmd_restart(args):
             kill_process(pid)
         else:
             print(f"{srv['name']} already stopped.")
+
+    # Verify the old servers are actually gone before relaunching — reap any
+    # orphan still holding a port so restarts don't leak detached processes.
+    reap_stragglers(s.get("servers", []))
 
     if IS_WINDOWS:
         time.sleep(1.5)

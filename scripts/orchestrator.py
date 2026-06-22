@@ -129,6 +129,7 @@ PROXY_ROUTES_FILE = PROXY_DIR / "routes.json"
 ACCESS_FILE = PROXY_DIR / "access.json"
 DEFAULT_PROXY_PORT = 1337
 DEFAULT_TLD = "localhost"
+CLAUDE_CMD = "claude --dangerously-skip-permissions"
 
 def _tld():    return os.environ.get("ORCH_TLD", DEFAULT_TLD)
 def _scheme(): return os.environ.get("ORCH_SCHEME", "http")
@@ -665,7 +666,7 @@ def run_setup_command(setup_cmd: str, cwd: Path, env: dict,
 def open_terminal_with_claude(worktree_path: Path, session_name: str):
     """Open a new terminal window running claude in the worktree directory."""
     wt_str = str(worktree_path)
-    claude_cmd = "claude --dangerously-skip-permissions"
+    claude_cmd = CLAUDE_CMD
 
     # Strip CLAUDECODE env var so the new terminal isn't detected as a nested session
     clean_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
@@ -796,6 +797,15 @@ def validate_no_secrets_in_config(repo_root: Path):
         print("Move these to .orchestrator/.secrets and remove", file=sys.stderr)
         print("them from .orchestrator.toml.", file=sys.stderr)
         print("=" * 60, file=sys.stderr)
+
+
+def panes_to_create(worktree_paths, existing_pane_paths):
+    """Worktree paths that have no tmux pane yet (additive reconcile).
+
+    Compared by normalized path so trailing slashes / '.' segments don't cause a
+    duplicate pane. Input order is preserved."""
+    existing = {os.path.normpath(p) for p in existing_pane_paths}
+    return [p for p in worktree_paths if os.path.normpath(p) not in existing]
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1672,59 @@ def cmd_proxy(args):
         print("\nProxy stopped.")
 
 
+def _tmux(*tmux_args):
+    return subprocess.run(["tmux", *tmux_args], capture_output=True, text=True)
+
+def tmux_session_exists(name):
+    return _tmux("has-session", "-t", name).returncode == 0
+
+def tmux_pane_paths(name):
+    r = _tmux("list-panes", "-t", name, "-F", "#{pane_current_path}")
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+def cmd_grid(args):
+    repo_root = find_repo_root()
+    proj = project_name(repo_root)
+    sessions = load_sessions(repo_root)
+    worktrees = [s["worktree"] for s in sessions.values()
+                 if s.get("worktree") and Path(s["worktree"]).exists()]
+    if not worktrees:
+        print("No worktrees with an existing directory yet. Spawn one first.")
+        return
+
+    try:
+        exists = tmux_session_exists(proj)
+    except FileNotFoundError:
+        print("Error: tmux is not installed.", file=sys.stderr)
+        sys.exit(1)
+
+    created = False
+    if not exists:
+        _tmux("new-session", "-d", "-s", proj, "-c", worktrees[0], CLAUDE_CMD)
+        created = True
+
+    existing = tmux_pane_paths(proj)
+    if created and worktrees[0] not in existing:
+        existing.append(worktrees[0])  # the just-created pane may not report its path yet
+    for wt in panes_to_create(worktrees, existing):
+        _tmux("split-window", "-t", proj, "-c", wt, CLAUDE_CMD)
+    _tmux("select-layout", "-t", proj, "tiled")
+
+    added = len(panes_to_create(worktrees, existing))
+    print(f"Grid '{proj}': {len(worktrees)} worktree(s); {added} pane(s) added"
+          + (" (new session)" if created else ""))
+
+    if os.environ.get("TMUX"):
+        _tmux("switch-client", "-t", proj)
+        print(f"Switched to grid '{proj}'.")
+    elif sys.stdout.isatty():
+        os.execvp("tmux", ["tmux", "attach", "-t", proj])
+    else:
+        print(f"Attach with: tmux attach -t {proj}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1706,6 +1769,9 @@ def main():
     p_proxy.add_argument("-p", "--port", type=int, default=DEFAULT_PROXY_PORT,
                          help=f"Port to listen on (default: {DEFAULT_PROXY_PORT})")
 
+    sub.add_parser("grid",
+                   help="Bring up/reattach a project's tiled tmux grid (one claude pane per worktree)")
+
     args = parser.parse_args()
     commands = {
         "init": cmd_init,
@@ -1716,6 +1782,7 @@ def main():
         "restart": cmd_restart,
         "cleanup": cmd_cleanup,
         "proxy": cmd_proxy,
+        "grid": cmd_grid,
     }
     commands[args.command](args)
 

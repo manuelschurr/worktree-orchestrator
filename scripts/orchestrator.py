@@ -1126,14 +1126,53 @@ def read_system_memory():
     except (OSError, subprocess.TimeoutExpired):
         return None
 
+def _parse_ps_tree(text):
+    """Parse `ps -eo pid=,ppid=,rss=` output into {pid: (ppid, rss_kb)}."""
+    tree = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            tree[int(parts[0])] = (int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+    return tree
+
+
+def sum_descendant_rss_mb(pid, ps_output):
+    """Total RSS (MB) of `pid` plus all its descendants, from a
+    `ps -eo pid=,ppid=,rss=` dump. Returns None if `pid` isn't present.
+
+    The recorded server PID is a shell wrapper whose dart/flutter child actually
+    holds the memory, so the wrapper's own RSS (~2 MB) is meaningless — we sum the
+    whole subtree to get the real footprint."""
+    tree = _parse_ps_tree(ps_output)
+    if pid not in tree:
+        return None
+    children = {}
+    for p, (ppid, _rss) in tree.items():
+        children.setdefault(ppid, []).append(p)
+    total, stack, seen = 0, [pid], set()
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        total += tree.get(cur, (0, 0))[1]
+        stack.extend(children.get(cur, []))
+    return round(total / 1024)
+
+
 def process_rss_mb(pid):
     if pid is None or IS_WINDOWS:
         return None
     try:
-        r = subprocess.run(["ps", "-o", "rss=", "-p", str(int(pid))],
+        r = subprocess.run(["ps", "-eo", "pid=,ppid=,rss="],
                            capture_output=True, text=True, timeout=5)
-        out = r.stdout.strip()
-        return round(int(out) / 1024) if out else None
+        if r.returncode != 0:
+            return None
+        return sum_descendant_rss_mb(int(pid), r.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
 

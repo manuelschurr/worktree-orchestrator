@@ -808,6 +808,21 @@ def panes_to_create(worktree_paths, existing_pane_paths):
     return [p for p in worktree_paths if os.path.normpath(p) not in existing]
 
 
+def worktree_paths_under(porcelain_text, base_dir):
+    """Session worktree paths from `git worktree list --porcelain` that live under
+    base_dir. `git worktree list` is the source of truth (sessions.json can be out of
+    sync); the main repo isn't under the worktrees base, so it's naturally excluded."""
+    base = os.path.normpath(str(base_dir))
+    out = []
+    for line in porcelain_text.splitlines():
+        if line.startswith("worktree "):
+            p = line[len("worktree "):].strip()
+            np = os.path.normpath(p)
+            if np == base or np.startswith(base + os.sep):
+                out.append(p)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -1687,11 +1702,14 @@ def tmux_pane_paths(name):
 def cmd_grid(args):
     repo_root = find_repo_root()
     proj = project_name(repo_root)
-    sessions = load_sessions(repo_root)
-    worktrees = [s["worktree"] for s in sessions.values()
-                 if s.get("worktree") and Path(s["worktree"]).exists()]
+    # Source of truth is `git worktree list`, not sessions.json (which can be out of
+    # sync with worktrees created/removed outside the orchestrator).
+    wt = subprocess.run(["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+                        capture_output=True, text=True)
+    worktrees = [p for p in worktree_paths_under(wt.stdout, worktree_base_dir(repo_root))
+                 if Path(p).exists()]
     if not worktrees:
-        print("No worktrees with an existing directory yet. Spawn one first.")
+        print("No worktrees yet. Spawn one first.")
         return
 
     try:
@@ -1708,21 +1726,19 @@ def cmd_grid(args):
     existing = tmux_pane_paths(proj)
     if created and worktrees[0] not in existing:
         existing.append(worktrees[0])  # the just-created pane may not report its path yet
-    for wt in panes_to_create(worktrees, existing):
-        _tmux("split-window", "-t", proj, "-c", wt, CLAUDE_CMD)
+    to_add = panes_to_create(worktrees, existing)
+    for path in to_add:
+        _tmux("split-window", "-t", proj, "-c", path, CLAUDE_CMD)
     _tmux("select-layout", "-t", proj, "tiled")
 
-    added = len(panes_to_create(worktrees, existing))
-    print(f"Grid '{proj}': {len(worktrees)} worktree(s); {added} pane(s) added"
+    print(f"Grid '{proj}': {len(worktrees)} worktree(s); {len(to_add)} pane(s) added"
           + (" (new session)" if created else ""))
-
+    # Never auto-attach/switch — the caller (often an agent inside tmux) would hijack
+    # the user's client. Print the command and let the user run it.
     if os.environ.get("TMUX"):
-        _tmux("switch-client", "-t", proj)
-        print(f"Switched to grid '{proj}'.")
-    elif sys.stdout.isatty():
-        os.execvp("tmux", ["tmux", "attach", "-t", proj])
+        print(f"Attach: tmux switch-client -t {proj}")
     else:
-        print(f"Attach with: tmux attach -t {proj}")
+        print(f"Attach: tmux attach -t {proj}")
 
 
 # ---------------------------------------------------------------------------

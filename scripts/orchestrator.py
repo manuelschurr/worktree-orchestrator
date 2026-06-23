@@ -384,7 +384,9 @@ def unregister_proxy_routes(project: str, session: str):
     routes = load_proxy_routes()
     tld = _tld()
     if session == MAIN_SESSION:
-        # apex hosts: <project>.<tld> (primary) and <project>-<server>.<tld>
+        # apex hosts: <project>.<tld> (primary) and <project>-<server>.<tld>.
+        # The <project>- prefix could in theory also match a sibling project named
+        # <project>-<x>; acceptable (project names rarely collide) and self-healing.
         apex = f"{project}.{tld}"
         prefix, suf = f"{project}-", f".{tld}"
         to_remove = [h for h in routes

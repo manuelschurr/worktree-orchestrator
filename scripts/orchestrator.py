@@ -382,10 +382,18 @@ def register_proxy_routes(project, session, port_map, primary_server=None):
 def unregister_proxy_routes(project: str, session: str):
     """Remove all hostname->port mappings for a session."""
     routes = load_proxy_routes()
-    suffix = f".{project}.{_tld()}"
-    to_remove = [h for h in routes
-                 if h.endswith(suffix)
-                 and (h.startswith(f"{session}.") or h.startswith(f"{session}-"))]
+    tld = _tld()
+    if session == MAIN_SESSION:
+        # apex hosts: <project>.<tld> (primary) and <project>-<server>.<tld>
+        apex = f"{project}.{tld}"
+        prefix, suf = f"{project}-", f".{tld}"
+        to_remove = [h for h in routes
+                     if h == apex or (h.startswith(prefix) and h.endswith(suf))]
+    else:
+        suffix = f".{project}.{tld}"
+        to_remove = [h for h in routes
+                     if h.endswith(suffix)
+                     and (h.startswith(f"{session}.") or h.startswith(f"{session}-"))]
     for h in to_remove:
         del routes[h]
     save_proxy_routes(routes)

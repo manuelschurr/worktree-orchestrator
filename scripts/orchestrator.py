@@ -991,6 +991,7 @@ def cmd_spawn(args):
 
     if name == MAIN_SESSION:
         wt_path = repo_root
+        branch = config["base_branch"]  # main runs on the base branch, in place
         print(f"Serving '{name}' in place at {wt_path} (no worktree).")
     else:
         branch = f"{config['branch_prefix']}{name}"

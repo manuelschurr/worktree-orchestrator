@@ -823,6 +823,13 @@ def worktree_paths_under(porcelain_text, base_dir):
     return out
 
 
+def grid_pane_command():
+    """Command a grid pane runs: plain `claude`. NOT --dangerously-skip-permissions —
+    claude refuses that as root (and the VPS runs as root); plain claude works and
+    honors the user's default permission mode. tmux execs this directly (no shell)."""
+    return "claude"
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -1718,9 +1725,10 @@ def cmd_grid(args):
         print("Error: tmux is not installed.", file=sys.stderr)
         sys.exit(1)
 
+    pane_cmd = grid_pane_command()
     created = False
     if not exists:
-        _tmux("new-session", "-d", "-s", proj, "-c", worktrees[0], CLAUDE_CMD)
+        _tmux("new-session", "-d", "-s", proj, "-c", worktrees[0], pane_cmd)
         created = True
 
     existing = tmux_pane_paths(proj)
@@ -1728,7 +1736,7 @@ def cmd_grid(args):
         existing.append(worktrees[0])  # the just-created pane may not report its path yet
     to_add = panes_to_create(worktrees, existing)
     for path in to_add:
-        _tmux("split-window", "-t", proj, "-c", path, CLAUDE_CMD)
+        _tmux("split-window", "-t", proj, "-c", path, pane_cmd)
     _tmux("select-layout", "-t", proj, "tiled")
 
     print(f"Grid '{proj}': {len(worktrees)} worktree(s); {len(to_add)} pane(s) added"

@@ -830,6 +830,44 @@ def grid_pane_command():
     return "claude"
 
 
+def reorder_swaps(current, desired):
+    """Selection-sort swaps to turn `current` (items by visual pane position) into
+    `desired`. Returns [(i, j)] position pairs; applying `swap-pane` between the panes
+    at positions i and j, in order, leaves panes reading in `desired` order. Used so a
+    re-added pane doesn't leave the grid out of worktree order."""
+    cur = list(current)
+    swaps = []
+    for k in range(len(desired)):
+        if cur[k] == desired[k]:
+            continue
+        j = cur.index(desired[k], k + 1)
+        swaps.append((k, j))
+        cur[k], cur[j] = cur[j], cur[k]
+    return swaps
+
+
+def _order_grid_panes(session):
+    """Reorder panes so the tiled grid reads in worktree order (top-left → bottom).
+    swap-pane preserves each pane's running process, so no Claude is disturbed."""
+    r = _tmux("list-panes", "-t", session, "-F",
+              "#{pane_id}\t#{pane_top}\t#{pane_left}\t#{pane_current_path}")
+    if r.returncode != 0:
+        return
+    rows = [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
+    rows.sort(key=lambda x: (int(x[1]), int(x[2])))   # visual order: top, then left
+    pane_ids = [x[0] for x in rows]
+    current = [x[3] for x in rows]
+
+    def _key(path):
+        base = os.path.basename(os.path.normpath(path))
+        return (0, int(base)) if base.isdigit() else (1, base)
+
+    desired = sorted(current, key=_key)
+    for i, j in reorder_swaps(current, desired):
+        _tmux("swap-pane", "-s", pane_ids[j], "-t", pane_ids[i])
+        pane_ids[i], pane_ids[j] = pane_ids[j], pane_ids[i]
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -1738,6 +1776,7 @@ def cmd_grid(args):
     for path in to_add:
         _tmux("split-window", "-t", proj, "-c", path, pane_cmd)
     _tmux("select-layout", "-t", proj, "tiled")
+    _order_grid_panes(proj)
 
     print(f"Grid '{proj}': {len(worktrees)} worktree(s); {len(to_add)} pane(s) added"
           + (" (new session)" if created else ""))
